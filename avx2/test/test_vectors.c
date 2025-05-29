@@ -11,6 +11,7 @@
 #include "../packing.h"
 
 #define MLEN 32
+#define CTXLEN 13
 #define NVECTORS 10000
 
 static unsigned int nttidx(unsigned int k) {
@@ -23,16 +24,12 @@ static unsigned int nttidx(unsigned int k) {
   return r;
 }
 
-void randombytes(uint8_t *out, size_t outlen) {
-  unsigned int i;
-  uint8_t buf[8];
-  static uint64_t ctr = 0;
+/* Initital state after absorbing empty string 
+ * Permute before squeeze is achieved by setting pos to SHAKE128_RATE */
+static keccak_state rngstate = {{0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (1ULL << 63), 0, 0, 0, 0}, SHAKE128_RATE};
 
-  for(i = 0; i < 8; ++i)
-    buf[i] = ctr >> 8*i;
-
-  ctr++;
-  shake128(out, outlen, buf, 8);
+void randombytes(uint8_t *x,size_t xlen) {
+  shake128_squeeze(x, xlen, &rngstate);
 }
 
 int main(void) {
@@ -41,12 +38,15 @@ int main(void) {
   uint8_t sk[CRYPTO_SECRETKEYBYTES];
   uint8_t sig[CRYPTO_BYTES];
   uint8_t m[MLEN];
+  uint8_t ctx[CTXLEN] = {0};
   uint8_t seed[CRHBYTES];
   uint8_t buf[CRYPTO_SECRETKEYBYTES];
   size_t siglen;
   poly c, tmp;
   polyvecl s, y, mat[K];
   polyveck w, w1, w0, t1, t0;
+
+  snprintf((char*)ctx,CTXLEN,"test_vectors");
 
   for(i = 0; i < NVECTORS; ++i) {
     printf("count = %u\n", i);
@@ -69,14 +69,14 @@ int main(void) {
       printf("%02x", buf[j]);
     printf("\n");
 
-    crypto_sign_signature(sig, &siglen, m, MLEN, sk);
+    crypto_sign_signature(sig, &siglen, m, MLEN, ctx, CTXLEN, sk);
     shake256(buf, 32, sig, CRYPTO_BYTES);
     printf("sig = ");
     for(j = 0; j < 32; ++j)
       printf("%02x", buf[j]);
     printf("\n");
 
-    if(crypto_sign_verify(sig, siglen, m, MLEN, pk))
+    if(crypto_sign_verify(sig, siglen, m, MLEN, ctx, CTXLEN, pk))
       fprintf(stderr,"Signature verification failed!\n");
 
     randombytes(seed, sizeof(seed));
@@ -99,16 +99,8 @@ int main(void) {
       }
     }
 
-#ifdef DILITHIUM_USE_AES
-    uint64_t nonce = 0;
-    aes256ctr_ctx state;
-    aes256ctr_init(&state, seed, nonce++);
-    for(j = 0; j < L; ++j) {
-      poly_uniform_eta_preinit(&s.vec[j], &state);
-      state.n = _mm_loadl_epi64((__m128i *)&nonce);
-      nonce++;
-    }
-#elif L == 4
+
+#if L == 4
     poly_uniform_eta_4x(&s.vec[0], &s.vec[1], &s.vec[2], &s.vec[3], seed, 0, 1, 2, 3);
 #elif L == 5
     poly_uniform_eta_4x(&s.vec[0], &s.vec[1], &s.vec[2], &s.vec[3], seed, 0, 1, 2, 3);
@@ -139,15 +131,7 @@ int main(void) {
       }
     }
 
-#ifdef DILITHIUM_USE_AES
-    nonce = 0;
-    aes256ctr_init(&state, seed, nonce++);
-    for(j = 0; j < L; ++j) {
-      poly_uniform_gamma1_preinit(&y.vec[j], &state);
-      state.n = _mm_loadl_epi64((__m128i *)&nonce);
-      nonce++;
-    }
-#elif L == 4
+#if L == 4
     poly_uniform_gamma1_4x(&y.vec[0], &y.vec[1], &y.vec[2], &y.vec[3], seed, 0, 1, 2, 3);
 #elif L == 5
     poly_uniform_gamma1_4x(&y.vec[0], &y.vec[1], &y.vec[2], &y.vec[3], seed, 0, 1, 2, 3);
@@ -207,7 +191,7 @@ int main(void) {
       fprintf(stderr, "ERROR in polyveck_chknorm(&w1, 16)!\n");
 #elif GAMMA2 == (Q-1)/88
     if(polyveck_chknorm(&w1, 44))
-      fprintf(stderr, "ERROR in polyveck_chknorm(&w1, 4)!\n");
+      fprintf(stderr, "ERROR in polyveck_chknorm(&w1, 44)!\n");
 #endif
     if(polyveck_chknorm(&w0, GAMMA2 + 1))
       fprintf(stderr, "ERROR in polyveck_chknorm(&w0, GAMMA2+1)!\n");

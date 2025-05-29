@@ -9,11 +9,7 @@
 #include "randombytes.h"
 #include "symmetric.h"
 #include "fips202.h"
-#ifdef DILITHIUM_USE_AES
-#include "aes256ctr.h"
-#endif
 
-#ifndef DILITHIUM_USE_AES
 static inline void polyvec_matrix_expand_row(polyvecl **row, polyvecl buf[2], const uint8_t rho[SEEDBYTES], unsigned int i) {
   switch(i) {
     case 0:
@@ -54,7 +50,6 @@ static inline void polyvec_matrix_expand_row(polyvecl **row, polyvecl buf[2], co
 #endif
   }
 }
-#endif
 
 /*************************************************
 * Name:        crypto_sign_keypair
@@ -72,20 +67,16 @@ int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
   unsigned int i;
   uint8_t seedbuf[2*SEEDBYTES + CRHBYTES];
   const uint8_t *rho, *rhoprime, *key;
-#ifdef DILITHIUM_USE_AES
-  uint64_t nonce;
-  aes256ctr_ctx aesctx;
-  polyvecl rowbuf[1];
-#else
   polyvecl rowbuf[2];
-#endif
   polyvecl s1, *row = rowbuf;
   polyveck s2;
   poly t1, t0;
 
   /* Get randomness for rho, rhoprime and key */
   randombytes(seedbuf, SEEDBYTES);
-  shake256(seedbuf, 2*SEEDBYTES + CRHBYTES, seedbuf, SEEDBYTES);
+  seedbuf[SEEDBYTES+0] = K;
+  seedbuf[SEEDBYTES+1] = L;
+  shake256(seedbuf, 2*SEEDBYTES + CRHBYTES, seedbuf, SEEDBYTES+2);
   rho = seedbuf;
   rhoprime = rho + SEEDBYTES;
   key = rhoprime + CRHBYTES;
@@ -96,19 +87,7 @@ int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
   memcpy(sk + SEEDBYTES, key, SEEDBYTES);
 
   /* Sample short vectors s1 and s2 */
-#ifdef DILITHIUM_USE_AES
-  aes256ctr_init(&aesctx, rhoprime, 0);
-  for(i = 0; i < L; ++i) {
-    nonce = i;
-    aesctx.n = _mm_loadl_epi64((__m128i *)&nonce);
-    poly_uniform_eta_preinit(&s1.vec[i], &aesctx);
-  }
-  for(i = 0; i < K; ++i) {
-    nonce = L + i;
-    aesctx.n = _mm_loadl_epi64((__m128i *)&nonce);
-    poly_uniform_eta_preinit(&s2.vec[i], &aesctx);
-  }
-#elif K == 4 && L == 4
+#if K == 4 && L == 4
   poly_uniform_eta_4x(&s1.vec[0], &s1.vec[1], &s1.vec[2], &s1.vec[3], rhoprime, 0, 1, 2, 3);
   poly_uniform_eta_4x(&s2.vec[0], &s2.vec[1], &s2.vec[2], &s2.vec[3], rhoprime, 4, 5, 6, 7);
 #elif K == 6 && L == 5
@@ -126,29 +105,16 @@ int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
 
   /* Pack secret vectors */
   for(i = 0; i < L; i++)
-    polyeta_pack(sk + 3*SEEDBYTES + i*POLYETA_PACKEDBYTES, &s1.vec[i]);
+    polyeta_pack(sk + 2*SEEDBYTES + TRBYTES + i*POLYETA_PACKEDBYTES, &s1.vec[i]);
   for(i = 0; i < K; i++)
-    polyeta_pack(sk + 3*SEEDBYTES + (L + i)*POLYETA_PACKEDBYTES, &s2.vec[i]);
+    polyeta_pack(sk + 2*SEEDBYTES + TRBYTES + (L + i)*POLYETA_PACKEDBYTES, &s2.vec[i]);
 
   /* Transform s1 */
   polyvecl_ntt(&s1);
 
-#ifdef DILITHIUM_USE_AES
-  aes256ctr_init(&aesctx, rho, 0);
-#endif
-
   for(i = 0; i < K; i++) {
     /* Expand matrix row */
-#ifdef DILITHIUM_USE_AES
-    for(unsigned int j = 0; j < L; j++) {
-      nonce = (i << 8) + j;
-      aesctx.n = _mm_loadl_epi64((__m128i *)&nonce);
-      poly_uniform_preinit(&row->vec[j], &aesctx);
-      poly_nttunpack(&row->vec[j]);
-    }
-#else
     polyvec_matrix_expand_row(&row, rowbuf, rho, i);
-#endif
 
     /* Compute inner-product */
     polyvecl_pointwise_acc_montgomery(&t1, row, &s1);
@@ -161,34 +127,39 @@ int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
     poly_caddq(&t1);
     poly_power2round(&t1, &t0, &t1);
     polyt1_pack(pk + SEEDBYTES + i*POLYT1_PACKEDBYTES, &t1);
-    polyt0_pack(sk + 3*SEEDBYTES + (L+K)*POLYETA_PACKEDBYTES + i*POLYT0_PACKEDBYTES, &t0);
+    polyt0_pack(sk + 2*SEEDBYTES + TRBYTES + (L+K)*POLYETA_PACKEDBYTES + i*POLYT0_PACKEDBYTES, &t0);
   }
 
   /* Compute H(rho, t1) and store in secret key */
-  shake256(sk + 2*SEEDBYTES, SEEDBYTES, pk, CRYPTO_PUBLICKEYBYTES);
+  shake256(sk + 2*SEEDBYTES, TRBYTES, pk, CRYPTO_PUBLICKEYBYTES);
 
   return 0;
 }
 
 /*************************************************
-* Name:        crypto_sign_signature
+* Name:        crypto_sign_signature_internal
 *
-* Description: Computes signature.
+* Description: Computes signature. Internal API.
 *
 * Arguments:   - uint8_t *sig: pointer to output signature (of length CRYPTO_BYTES)
 *              - size_t *siglen: pointer to output length of signature
 *              - uint8_t *m: pointer to message to be signed
 *              - size_t mlen: length of message
+*              - uint8_t *pre: pointer to prefix string
+*              - size_t prelen: length of prefix string
+*              - uint8_t *rnd: pointer to random seed
 *              - uint8_t *sk: pointer to bit-packed secret key
 *
 * Returns 0 (success)
 **************************************************/
-int crypto_sign_signature(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t mlen, const uint8_t *sk) {
+int crypto_sign_signature_internal(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t mlen,
+                                   const uint8_t *pre, size_t prelen, const uint8_t rnd[RNDBYTES], const uint8_t *sk)
+{
   unsigned int i, n, pos;
-  uint8_t seedbuf[3*SEEDBYTES + 2*CRHBYTES];
+  uint8_t seedbuf[2*SEEDBYTES + TRBYTES + 2*CRHBYTES];
   uint8_t *rho, *tr, *key, *mu, *rhoprime;
   uint8_t hintbuf[N];
-  uint8_t *hint = sig + SEEDBYTES + L*POLYZ_PACKEDBYTES;
+  uint8_t *hint = sig + CTILDEBYTES + L*POLYZ_PACKEDBYTES;
   uint64_t nonce = 0;
   polyvecl mat[K], s1, z;
   polyveck t0, s2, w1;
@@ -201,23 +172,26 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t
 
   rho = seedbuf;
   tr = rho + SEEDBYTES;
-  key = tr + SEEDBYTES;
+  key = tr + TRBYTES;
   mu = key + SEEDBYTES;
   rhoprime = mu + CRHBYTES;
   unpack_sk(rho, tr, key, &t0, &s1, &s2, sk);
 
-  /* Compute CRH(tr, msg) */
+  /* Compute mu = CRH(tr, pre, msg) */
   shake256_init(&state);
-  shake256_absorb(&state, tr, SEEDBYTES);
+  shake256_absorb(&state, tr, TRBYTES);
+  shake256_absorb(&state, pre, prelen);
   shake256_absorb(&state, m, mlen);
   shake256_finalize(&state);
   shake256_squeeze(mu, CRHBYTES, &state);
 
-#ifdef DILITHIUM_RANDOMIZED_SIGNING
-  randombytes(rhoprime, CRHBYTES);
-#else
-  shake256(rhoprime, CRHBYTES, key, SEEDBYTES + CRHBYTES);
-#endif
+  /* Compute rhoprime = CRH(key, rnd, mu) */
+  shake256_init(&state);
+  shake256_absorb(&state, key, SEEDBYTES);
+  shake256_absorb(&state, rnd, RNDBYTES);
+  shake256_absorb(&state, mu, CRHBYTES);
+  shake256_finalize(&state);
+  shake256_squeeze(rhoprime, CRHBYTES, &state);
 
   /* Expand matrix and transform vectors */
   polyvec_matrix_expand(mat, rho);
@@ -225,20 +199,9 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t
   polyveck_ntt(&s2);
   polyveck_ntt(&t0);
 
-#ifdef DILITHIUM_USE_AES
-  aes256ctr_ctx aesctx;
-  aes256ctr_init(&aesctx, rhoprime, 0);
-#endif
-
 rej:
   /* Sample intermediate vector y */
-#ifdef DILITHIUM_USE_AES
-  for(i = 0; i < L; ++i) {
-    aesctx.n = _mm_loadl_epi64((__m128i *)&nonce);
-    nonce++;
-    poly_uniform_gamma1_preinit(&z.vec[i], &aesctx);
-  }
-#elif L == 4
+#if L == 4
   poly_uniform_gamma1_4x(&z.vec[0], &z.vec[1], &z.vec[2], &z.vec[3],
                          rhoprime, nonce, nonce + 1, nonce + 2, nonce + 3);
   nonce += 4;
@@ -272,7 +235,7 @@ rej:
   shake256_absorb(&state, mu, CRHBYTES);
   shake256_absorb(&state, sig, K*POLYW1_PACKEDBYTES);
   shake256_finalize(&state);
-  shake256_squeeze(sig, SEEDBYTES, &state);
+  shake256_squeeze(sig, CTILDEBYTES, &state);
   poly_challenge(&c, sig);
   poly_ntt(&c);
 
@@ -319,9 +282,48 @@ rej:
 
   /* Pack z into signature */
   for(i = 0; i < L; i++)
-    polyz_pack(sig + SEEDBYTES + i*POLYZ_PACKEDBYTES, &z.vec[i]);
+    polyz_pack(sig + CTILDEBYTES + i*POLYZ_PACKEDBYTES, &z.vec[i]);
 
   *siglen = CRYPTO_BYTES;
+  return 0;
+}
+
+/*************************************************
+* Name:        crypto_sign_signature
+*
+* Description: Computes signature.
+*
+* Arguments:   - uint8_t *sig: pointer to output signature (of length CRYPTO_BYTES)
+*              - size_t *siglen: pointer to output length of signature
+*              - uint8_t *m: pointer to message to be signed
+*              - size_t mlen: length of message
+*              - uint8_t *ctx: pointer to context string
+*              - size_t ctxlen: length of context string
+*              - uint8_t *sk: pointer to bit-packed secret key
+*
+* Returns 0 (success) or -1 (context string too long)
+**************************************************/
+int crypto_sign_signature(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t mlen,
+                          const uint8_t *ctx, size_t ctxlen, const uint8_t *sk)
+{
+  uint8_t pre[257];
+  uint8_t rnd[RNDBYTES];
+
+  if(ctxlen > 255)
+    return -1;
+
+  /* Prepare pre = (0, ctxlen, ctx) */
+  pre[0] = 0;
+  pre[1] = ctxlen;
+  memcpy(&pre[2], ctx, ctxlen);
+
+#ifdef DILITHIUM_RANDOMIZED_SIGNING
+  randombytes(rnd, RNDBYTES);
+#else
+  memset(rnd, 0, RNDBYTES);
+#endif
+
+  crypto_sign_signature_internal(sig,siglen,m,mlen,pre,2+ctxlen,rnd,sk);
   return 0;
 }
 
@@ -337,46 +339,48 @@ rej:
 *                               message
 *              - const uint8_t *m: pointer to message to be signed
 *              - size_t mlen: length of message
+*              - const uint8_t *ctx: pointer to context string
+*              - size_t ctxlen: length of context string
 *              - const uint8_t *sk: pointer to bit-packed secret key
 *
 * Returns 0 (success)
 **************************************************/
-int crypto_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen, const uint8_t *sk) {
+int crypto_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen, const uint8_t *ctx, size_t ctxlen,
+                const uint8_t *sk)
+{
   size_t i;
+  int ret;
 
   for(i = 0; i < mlen; ++i)
     sm[CRYPTO_BYTES + mlen - 1 - i] = m[mlen - 1 - i];
-  crypto_sign_signature(sm, smlen, sm + CRYPTO_BYTES, mlen, sk);
+  ret = crypto_sign_signature(sm, smlen, sm + CRYPTO_BYTES, mlen, ctx, ctxlen, sk);
   *smlen += mlen;
-  return 0;
+  return ret;
 }
 
 /*************************************************
-* Name:        crypto_sign_verify
+* Name:        crypto_sign_verify_internal
 *
-* Description: Verifies signature.
+* Description: Verifies signature. Internal API.
 *
 * Arguments:   - uint8_t *m: pointer to input signature
 *              - size_t siglen: length of signature
 *              - const uint8_t *m: pointer to message
 *              - size_t mlen: length of message
+*              - const uint8_t *pre: pointer to prefix string
+*              - size_t prelen: length of prefix string
 *              - const uint8_t *pk: pointer to bit-packed public key
 *
 * Returns 0 if signature could be verified correctly and -1 otherwise
 **************************************************/
-int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size_t mlen, const uint8_t *pk) {
+int crypto_sign_verify_internal(const uint8_t *sig, size_t siglen, const uint8_t *m, size_t mlen,
+                                const uint8_t *pre, size_t prelen, const uint8_t *pk) {
   unsigned int i, j, pos = 0;
   /* polyw1_pack writes additional 14 bytes */
   ALIGNED_UINT8(K*POLYW1_PACKEDBYTES+14) buf;
   uint8_t mu[CRHBYTES];
-  const uint8_t *hint = sig + SEEDBYTES + L*POLYZ_PACKEDBYTES;
-#ifdef DILITHIUM_USE_AES
-  uint64_t nonce;
-  aes256ctr_ctx aesctx;
-  polyvecl rowbuf[1];
-#else
+  const uint8_t *hint = sig + CTILDEBYTES + L*POLYZ_PACKEDBYTES;
   polyvecl rowbuf[2];
-#endif
   polyvecl *row = rowbuf;
   polyvecl z;
   poly c, w1, h;
@@ -385,10 +389,11 @@ int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size
   if(siglen != CRYPTO_BYTES)
     return -1;
 
-  /* Compute CRH(H(rho, t1), msg) */
-  shake256(mu, SEEDBYTES, pk, CRYPTO_PUBLICKEYBYTES);
+  /* Compute CRH(H(rho, t1), pre, msg) */
+  shake256(mu, TRBYTES, pk, CRYPTO_PUBLICKEYBYTES);
   shake256_init(&state);
-  shake256_absorb(&state, mu, SEEDBYTES);
+  shake256_absorb(&state, mu, CRHBYTES);
+  shake256_absorb(&state, pre, prelen);
   shake256_absorb(&state, m, mlen);
   shake256_finalize(&state);
   shake256_squeeze(mu, CRHBYTES, &state);
@@ -399,26 +404,13 @@ int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size
 
   /* Unpack z; shortness follows from unpacking */
   for(i = 0; i < L; i++) {
-    polyz_unpack(&z.vec[i], sig + SEEDBYTES + i*POLYZ_PACKEDBYTES);
+    polyz_unpack(&z.vec[i], sig + CTILDEBYTES + i*POLYZ_PACKEDBYTES);
     poly_ntt(&z.vec[i]);
   }
 
-#ifdef DILITHIUM_USE_AES
-  aes256ctr_init(&aesctx, pk, 0);
-#endif
-
   for(i = 0; i < K; i++) {
     /* Expand matrix row */
-#ifdef DILITHIUM_USE_AES
-    for(j = 0; j < L; j++) {
-      nonce = (i << 8) + j;
-      aesctx.n = _mm_loadl_epi64((__m128i *)&nonce);
-      poly_uniform_preinit(&row->vec[j], &aesctx);
-      poly_nttunpack(&row->vec[j]);
-    }
-#else
     polyvec_matrix_expand_row(&row, rowbuf, pk, i);
-#endif
 
     /* Compute i-th row of Az - c2^Dt1 */
     polyvecl_pointwise_acc_montgomery(&w1, row, &z);
@@ -458,12 +450,41 @@ int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size
   shake256_absorb(&state, mu, CRHBYTES);
   shake256_absorb(&state, buf.coeffs, K*POLYW1_PACKEDBYTES);
   shake256_finalize(&state);
-  shake256_squeeze(buf.coeffs, SEEDBYTES, &state);
-  for(i = 0; i < SEEDBYTES; ++i)
+  shake256_squeeze(buf.coeffs, CTILDEBYTES, &state);
+  for(i = 0; i < CTILDEBYTES; ++i)
     if(buf.coeffs[i] != sig[i])
       return -1;
 
   return 0;
+}
+
+/*************************************************
+* Name:        crypto_sign_verify
+*
+* Description: Verifies signature.
+*
+* Arguments:   - uint8_t *m: pointer to input signature
+*              - size_t siglen: length of signature
+*              - const uint8_t *m: pointer to message
+*              - size_t mlen: length of message
+*              - const uint8_t *ctx: pointer to context string
+*              - size_t ctxlen: length of context string
+*              - const uint8_t *pk: pointer to bit-packed public key
+*
+* Returns 0 if signature could be verified correctly and -1 otherwise
+**************************************************/
+int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size_t mlen,
+                       const uint8_t *ctx, size_t ctxlen, const uint8_t *pk)
+{
+  uint8_t pre[257];
+
+  if(ctxlen > 255)
+    return -1;
+
+  pre[0] = 0;
+  pre[1] = ctxlen;
+  memcpy(&pre[2], ctx, ctxlen);
+  return crypto_sign_verify_internal(sig,siglen,m,mlen,pre,2+ctxlen,pk);
 }
 
 /*************************************************
@@ -476,18 +497,21 @@ int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size
 *              - size_t *mlen: pointer to output length of message
 *              - const uint8_t *sm: pointer to signed message
 *              - size_t smlen: length of signed message
+*              - const uint8_t *ctx: pointer to context string
+*              - size_t ctxlen: length of context string
 *              - const uint8_t *pk: pointer to bit-packed public key
 *
 * Returns 0 if signed message could be verified correctly and -1 otherwise
 **************************************************/
-int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen, const uint8_t *pk) {
+int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen,
+                     const uint8_t *ctx, size_t ctxlen, const uint8_t *pk) {
   size_t i;
 
   if(smlen < CRYPTO_BYTES)
     goto badsig;
 
   *mlen = smlen - CRYPTO_BYTES;
-  if(crypto_sign_verify(sm, CRYPTO_BYTES, sm + CRYPTO_BYTES, *mlen, pk))
+  if(crypto_sign_verify(sm, CRYPTO_BYTES, sm + CRYPTO_BYTES, *mlen, ctx, ctxlen, pk))
     goto badsig;
   else {
     /* All good, copy msg, return 0 */
@@ -498,7 +522,7 @@ int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen, 
 
 badsig:
   /* Signature verification failed */
-  *mlen = -1;
+  *mlen = 0;
   for(i = 0; i < smlen; ++i)
     m[i] = 0;
 
